@@ -14,7 +14,6 @@ builder.Services.AddSwaggerGen();
 
 // 2. Configure SQL Server 2025 Connection with EF Core
 string? connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-//?? "Server=.\\SQL2025;Database=Dev;User Id=sa;password=Allah@ALL1;TrustServerCertificate=True;MultipleActiveResultSets=True;";
 
 if (string.IsNullOrWhiteSpace(connectionString))
     throw new InvalidOperationException(
