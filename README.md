@@ -70,10 +70,10 @@ Question
    │                        FROM DocumentChunks
    │                        ORDER BY VECTOR_DISTANCE('cosine', Embedding, CAST(@p AS VECTOR(1024))) ASC
    │
-   ├─ 3. PROMPT            system prompt restricts the model to retrieved context;
-   │                       chunks joined with a "\n---\n" separator
-   │
-   └─ 4. GENERATION        IChatClient.GetResponseAsync → answer + sources + total timing
+    ├─ 3. PROMPT            system prompt restricts the model to retrieved context;
+    │                       chunks joined with a "\n---\n" separator
+    │
+    └─ 4. GENERATION        IChatClient.GetStreamingResponseAsync → streamed tokens
 ```
 
 Notes on this flow:
@@ -87,6 +87,27 @@ Notes on this flow:
   > information, state that clearly.
 - `.Select(c => c.ChunkContent)` projects **only** the text, so the response has no way to say which
   document a chunk came from (see [Known Issues](#known-issues)).
+
+### Streaming — `POST /api/Documents/chat/stream`
+
+The same retrieval runs first (embed + one SQL query), then the answer is streamed as
+**Server-Sent Events** so the UI can render tokens as they arrive instead of waiting for the full
+response.
+
+```
+event: sources   data: ["chunk 1", "chunk 2", "chunk 3"]
+event: token     data: "The"
+event: token     data: " main"
+event: token     data: " topic"
+...
+event: done      data: {"totalTimeMs":1240}
+```
+
+- `Content-Type: text/event-stream`, flushed per token.
+- Client disconnect (the Angular **Stop** button) cancels via `HttpContext.RequestAborted` and exits
+  cleanly — no error event is sent.
+- Failures emit `event: error` with `{ "message": "..." }`.
+- The buffered `/chat` above is kept as a non-streaming fallback.
 
 ---
 
@@ -280,9 +301,8 @@ curl.exe -k -X POST https://localhost:44347/api/Documents/upload -F "file=@C:\do
 
 | Status | Condition |
 | --- | --- |
-| **400** | no file, zero-length file, or no extractable text |
+| **400** | no file, zero-length file, no extractable text, or unsupported extension |
 | **413** | document yields more than 20,000 chunks |
-| **500** | unsupported extension — `NotSupportedException` escapes unhandled |
 
 The request is synchronous and CPU-bound. Progress is written to the application log:
 
@@ -309,6 +329,8 @@ Chunks are removed by the `ON DELETE CASCADE` foreign key.
 
 ### `POST /api/Documents/chat`
 
+Buffered fallback — use [`/chat/stream`](#post-apidocumentschatstream) for streaming.
+
 ```json
 { "question": "What is the partition replication model?" }
 ```
@@ -326,6 +348,44 @@ Chunks are removed by the `ON DELETE CASCADE` foreign key.
 
 The response is a buffered JSON string, so the answer is **not** streamed. `timing` reports total elapsed
 only; the per-stage breakdown is scaffolded in comments at `DocumentsController.cs:242-244`.
+
+---
+
+### `POST /api/Documents/chat/stream`
+
+Streams the answer as Server-Sent Events. Same request body as `/chat`.
+
+```json
+{ "question": "What is the partition replication model?" }
+```
+
+**`200 OK` — `text/event-stream`**
+
+```
+event: sources
+data: ["chunk 1", "chunk 2", "chunk 3"]
+
+event: token
+data: "Kafka"
+
+event: token
+data: " replicates"
+
+event: done
+data: {"totalTimeMs":1240}
+```
+
+| Event | Meaning |
+| --- | --- |
+| `sources` | the retrieved chunks, sent first so the UI can show them immediately |
+| `token` | one answer delta — repeated until generation finishes |
+| `done` | `{ totalTimeMs }` — marks the end of the stream |
+| `error` | `{ message }` — emitted if generation fails |
+
+**400** — empty question (plain text, before the stream opens).
+
+The Angular client (`ChatStreamService`) parses these frames and renders tokens live, with a **Stop**
+button that aborts the request. See the [frontend README](../VectorSearch.Web/README.md).
 
 ---
 
@@ -502,9 +562,6 @@ Then remove the credential from `appsettings.json` (use a placeholder) and delet
 
 ### 7. Robustness
 
-- **Unsupported extension → 500.** The `switch` at `:107` throws `NotSupportedException` for an
-  unrecognised extension. Validate the extension before the switch and return a `400` listing what is
-  supported.
 - **No dedupe.** Re-uploading a file creates a second full copy of every vector.
 - **No pagination.** `GET /api/Documents` is unbounded and `GET /{id}` dumps every chunk's full text; both
   degrade as the corpus grows.
