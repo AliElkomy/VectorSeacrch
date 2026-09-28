@@ -96,6 +96,10 @@ namespace VectorSeacrch.Controllers
                 return BadRequest("No file was provided.");
 
             string extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+
+            if (extension is not (".txt" or ".pdf" or ".docx"))
+                return BadRequest($"Unsupported file format '{extension}'. Supported: .txt, .pdf, .docx.");
+
             using var stream = file.OpenReadStream();
 
             // 1. Extract Text
@@ -243,6 +247,88 @@ namespace VectorSeacrch.Controllers
                     //AiGenerationMs = aiElapsedMs
                 }
             });
+        }
+
+        // =========================================================================
+        // RAG: STREAMING CHAT (SSE)
+        // =========================================================================
+        // Emits named SSE events the Angular ChatStreamService can distinguish:
+        //   sources → retrieved chunks, token → answer delta, done → timing, error → message
+        [HttpPost("chat/stream")]
+        public async Task ChatStream([FromBody] ChatRequest request)
+        {
+            if (string.IsNullOrWhiteSpace(request.Question))
+            {
+                Response.StatusCode = StatusCodes.Status400BadRequest;
+                await Response.WriteAsync("Question cannot be empty.");
+                return;
+            }
+
+            Response.ContentType = "text/event-stream";
+            Response.Headers.CacheControl = "no-cache";
+
+            var stopwatch = Stopwatch.StartNew();
+
+            // 1. Convert Query to Vector via Ollama
+            var queryEmbedding = await _embeddingGenerator.GenerateAsync(new[] { request.Question });
+            string jsonQueryVector = JsonSerializer.Serialize(queryEmbedding[0].Vector.ToArray());
+
+            // 2. Perform Native SQL Server 2025 Vector Search
+            var contextChunks = await _context.DocumentChunks
+                .FromSqlInterpolated($@"
+                    SELECT TOP (3) ChunkID, DocumentID, ChunkContent, Embedding
+                    FROM DocumentChunks
+                    ORDER BY VECTOR_DISTANCE('cosine', Embedding, CAST({jsonQueryVector} AS VECTOR(1024))) ASC")
+                .Select(c => c.ChunkContent)
+                .ToListAsync();
+
+            // 3. Build Prompt
+            string contextText = contextChunks.Count > 0
+                ? string.Join("\n---\n", contextChunks)
+                : "No relevant document context found.";
+
+            var messages = new List<ChatMessage>
+            {
+                new(ChatRole.System, "Answer the question using ONLY the provided document context. If the context does not contain enough information, state that clearly."),
+                new(ChatRole.User, $"Context:\n{contextText}\n\nQuestion: {request.Question}")
+            };
+
+            await using var writer = new StreamWriter(Response.Body);
+
+            // 4. Send the retrieved context first so the UI can show sources immediately.
+            await WriteEventAsync(writer, "sources", contextChunks);
+
+            // 5. Stream the answer token by token.
+            try
+            {
+                await foreach (var update in _chatClient.GetStreamingResponseAsync(
+                    messages, cancellationToken: HttpContext.RequestAborted))
+                {
+                    if (!string.IsNullOrEmpty(update.Text))
+                    {
+                        await WriteEventAsync(writer, "token", update.Text);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Client disconnected (e.g. Stop button) — nothing more to send.
+                return;
+            }
+            catch (Exception ex)
+            {
+                await WriteEventAsync(writer, "error", new { message = ex.Message });
+                return;
+            }
+
+            stopwatch.Stop();
+            await WriteEventAsync(writer, "done", new { totalTimeMs = stopwatch.ElapsedMilliseconds });
+        }
+
+        private static async Task WriteEventAsync(StreamWriter writer, string name, object data)
+        {
+            await writer.WriteAsync($"event: {name}\ndata: {JsonSerializer.Serialize(data)}\n\n");
+            await writer.FlushAsync();
         }
 
         #region Document Extractors & Chunking Helpers

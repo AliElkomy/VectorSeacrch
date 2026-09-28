@@ -40,10 +40,10 @@ var ollamaHttpClient = new HttpClient
 builder.Services.AddSingleton(ollamaHttpClient);
 
 builder.Services.AddSingleton<IEmbeddingGenerator<string, Embedding<float>>>(
-    new OllamaApiClient(ollamaHttpClient, defaultModel: "qwen3-embedding:0.6b"));
+    new OllamaApiClient(ollamaHttpClient, defaultModel: "qwen3-embedding:0.6b"));  
 
 builder.Services.AddSingleton<IChatClient>(
-    new OllamaApiClient(ollamaHttpClient, defaultModel: "qwen2.5:1.5b")); //llama3.2
+    new OllamaApiClient(ollamaHttpClient, defaultModel: "qwen2.5:1.5b")); //llama3.2  //qwen2.5:1.5b
 
 var app = builder.Build();
 
